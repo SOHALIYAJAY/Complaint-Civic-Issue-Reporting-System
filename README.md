@@ -146,6 +146,6 @@ Sample response (201 Created):
 
 
 
-- Short repo description (3–4 lines) for GitHub:
+ Short repo description (3–4 lines) for GitHub:
 
 > Complaint Civic Issue Reporting System — a full-stack web application for citizens to report civic issues (potholes, streetlights, waste) with photo uploads, geolocation, and a management dashboard for authorities to triage and resolve reports. Built with TypeScript and Python (replace with exact frameworks used).
