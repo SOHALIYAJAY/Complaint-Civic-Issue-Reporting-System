@@ -2,18 +2,6 @@
 
 A full-stack web application that enables citizens to report civic issues and allows authorities to manage and resolve them efficiently.
 
-<!-- Badges (replace URLs with your CI/coverage/license URLs) -->
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](#)
-
-
-## Demo
-
-> Live demo: _Add your live demo link here_
-
-![screenshot](docs/demo-placeholder.png)
-
-
 ## Why this project
 
 Many cities and municipalities lack an easy, centralized way for citizens to report civic issues (potholes, broken streetlights, waste collection problems). This project provides a user-friendly reporting interface for citizens and a management dashboard for authorities to triage, assign, and resolve issues — improving response times and transparency.
