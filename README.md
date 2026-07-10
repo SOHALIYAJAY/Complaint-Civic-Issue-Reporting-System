@@ -309,7 +309,7 @@ This project is open-sourced under the MIT License. See LICENSE for details.
 
 ## Authors & Maintainers
 
-- Yugbhensadadiya — main author
+- Yugbhensadadiya, Jay Sohaliya — main author
 
 
 ## Acknowledgements
