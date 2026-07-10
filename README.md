@@ -67,75 +67,23 @@ cd Complaint-Civic-Issue-Reporting-System-main
 Install frontend dependencies (if there's a frontend folder):
 
 ```bash
-# If frontend uses npm
 cd frontend
 npm install
 npm run dev
-# or with yarn
-# yarn && yarn dev
 ```
 
 Install backend dependencies:
 
 ```bash
-# If backend is TypeScript (Node) in backend/:
-cd backend
-npm install
-npm run dev
 
-# If backend is Python (FastAPI/Django):
+# backend is Python (Django):
 cd backend
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-# Run dev server (FastAPI example)
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-
-# Or Django example
-# python manage.py migrate
-# python manage.py runserver
+python manage.py migrate
+python manage.py runserver
 ```
-
-Docker (recommended):
-
-```bash
-# Example docker compose (replace with actual docker-compose.yml in repo)
-docker compose up --build
-```
-
-
-## Environment variables
-
-Create a .env file in backend/ with values like:
-
-```
-# Database
-DATABASE_URL=postgresql://user:password@localhost:5432/complaints_db
-# For SQLite (dev)
-# DATABASE_URL=sqlite:///./dev.db
-
-# Secrets
-SECRET_KEY=your_secret_key_here
-JWT_SECRET=supersecretjwtkey
-
-# App
-NODE_ENV=development
-PORT=3000
-
-# Storage / integrations
-S3_BUCKET=your-bucket-name
-S3_REGION=your-region
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-MAPS_API_KEY=your-maps-api-key
-SMTP_HOST=smtp.example.com
-SMTP_USER=you@example.com
-SMTP_PASS=...
-TWILIO_SID=...
-TWILIO_AUTH_TOKEN=...
-```
-
-Replace placeholders with your values before running the app.
 
 
 ## Running the app
@@ -152,12 +100,12 @@ cd frontend
 npm run dev
 ```
 
-Start backend (FastAPI example):
+Start backend (Django example):
 
 ```bash
 cd backend
 source .venv/bin/activate
-uvicorn app.main:app --reload --port 8000
+
 ```
 
 Production build (example):
@@ -175,13 +123,6 @@ npm run build && npm start   # Node
 
 
 ## Database migrations & seeding
-
-If using Alembic (SQLAlchemy/FastAPI):
-
-```bash
-alembic upgrade head
-alembic revision --autogenerate -m "add table"
-```
 
 If using Django:
 
@@ -231,37 +172,6 @@ Sample response (201 Created):
 }
 ```
 
-
-## Testing
-
-Run tests depending on your stack:
-
-```bash
-# JavaScript/TypeScript tests
-cd backend
-npm test
-
-# Python tests
-cd backend
-pytest
-```
-
-
-## Deployment
-
-Options:
-- Docker / Docker Compose: containerize frontend and backend, set environment variables, use managed DB
-- Heroku / Railway: push code and set env vars through the platform
-- Vercel: deploy the frontend (Next.js) and host serverless API or point to backend
-
-Production considerations:
-- Use HTTPS/SSL
-- Secure secrets via environment variables or secret store
-- Use persistent object storage for uploads (S3)
-- Configure CORS to allow your frontend domain
-- Run background workers for heavy tasks (image processing, notifications)
-
-
 ## Contributing
 
 - Open an issue describing the bug or feature
@@ -289,12 +199,6 @@ Production considerations:
 /tests/            # unit & integration tests
 ```
 
-
-## License
-
-This project is open-sourced under the MIT License. See LICENSE for details.
-
-
 ## Authors & Maintainers
 
 - Yugbhensadadiya, Jay Sohaliya — main author
@@ -303,16 +207,6 @@ This project is open-sourced under the MIT License. See LICENSE for details.
 ## Acknowledgements
 
 - Thanks to open-source libraries and tools used in this project
-
-
-## How to adapt this README to your repo
-
-1. Replace the demo image and live demo link.
-2. Update the Tech Stack section with actual frameworks used (React, Next, FastAPI, Express, etc.).
-3. Replace example local setup commands with the exact commands used in your project (e.g., `npm start`, `uvicorn app.main:app`).
-4. Fill in the Environment Variables with the exact variable names your app uses.
-5. Add CI/CD and coverage badges with real URLs.
-
 
 ---
 
