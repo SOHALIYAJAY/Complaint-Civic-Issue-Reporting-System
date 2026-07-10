@@ -48,44 +48,6 @@ Frontend (React) <---> Backend API (FastAPI / Express) <---> Database (Postgres)
                                       +---> Object Storage (S3 / local)
                                       +---> Email/SMS services
 
-
-## Quickstart (developer)
-
-Prerequisites:
-- Node.js 16+ and npm or yarn
-- Python 3.8+ (if backend uses Python)
-- PostgreSQL (or SQLite for quick local dev)
-- Docker & Docker Compose (optional, recommended)
-
-Clone the repo:
-
-```bash
-git clone https://github.com/Yugbhensadadiya/Complaint-Civic-Issue-Reporting-System-main.git
-cd Complaint-Civic-Issue-Reporting-System-main
-```
-
-Install frontend dependencies (if there's a frontend folder):
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Install backend dependencies:
-
-```bash
-
-# backend is Python (Django):
-cd backend
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-python manage.py migrate
-python manage.py runserver
-```
-
-
 ## Running the app
 
 Development (example):
@@ -105,6 +67,8 @@ Start backend (Django example):
 ```bash
 cd backend
 source .venv/bin/activate
+python manage.py migrate
+python manage.py runserver
 
 ```
 
@@ -124,15 +88,10 @@ npm run build && npm start   # Node
 
 ## Database migrations & seeding
 
-If using Django:
-
 ```bash
 python manage.py migrate
 python manage.py loaddata initial_data.json  # if you have a fixture
 ```
-
-If using Prisma or TypeORM for TypeScript, use their migration commands — replace these placeholders with the commands your repo uses.
-
 
 ## API (example)
 
@@ -172,14 +131,6 @@ Sample response (201 Created):
 }
 ```
 
-## Contributing
-
-- Open an issue describing the bug or feature
-- Fork => create a branch feature/your-feature or fix/issue-123 => create a Pull Request
-- Follow code style: Prettier + ESLint for JS/TS, black/isort for Python
-- Tests should be added for new features and fixed bugs
-- Use conventional commits or your project's commit guidelines
-
 
 ## Troubleshooting & Common Issues
 
@@ -194,14 +145,13 @@ Sample response (201 Created):
 /README.md
 /frontend/         # React/Next frontend
 /backend/          # API server (TypeScript or Python)
-/docs/             # Docs and design assets
-/scripts/          # helper scripts
-/tests/            # unit & integration tests
+
 ```
 
 ## Authors & Maintainers
 
-- Yugbhensadadiya, Jay Sohaliya — main author
+- Yugbhensadadiya
+- Jay Sohaliya 
 
 
 ## Acknowledgements
