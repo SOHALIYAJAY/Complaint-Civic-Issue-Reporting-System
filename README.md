@@ -141,15 +141,9 @@ Sample response (201 Created):
 
 ## Authors & Maintainers
 
-- Yugbhensadadiya
+- Yug bhensadadiya
 - Jay Sohaliya 
 
-
-## Acknowledgements
-
-- Thanks to open-source libraries and tools used in this project
-
----
 
 Short repo description (3–4 lines) for GitHub:
 
