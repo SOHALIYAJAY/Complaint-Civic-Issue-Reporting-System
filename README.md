@@ -139,15 +139,6 @@ Sample response (201 Created):
 - CORS errors: ensure backend’s CORS config allows the frontend origin
 
 
-## Project structure (example)
-
-```
-/README.md
-/frontend/         # React/Next frontend
-/backend/          # API server (TypeScript or Python)
-
-```
-
 ## Authors & Maintainers
 
 - Yugbhensadadiya
