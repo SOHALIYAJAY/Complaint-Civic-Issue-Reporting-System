@@ -2,16 +2,40 @@ from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView, RetrieveUpdateDestroyAPIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import CustomUser, EmailOTP
+from .models import CustomUser, PendingUser
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework.permissions import IsAuthenticated
-from google.oauth2 import id_token
-from google.auth.transport import requests
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from accounts.serializers import UserRegister, UserDetailSerializer, UserUpdateSerializer, UserAdminSerializer
+import os
+import random
+import logging
+from datetime import timedelta
 from complaints.models import Complaint
 from rest_framework.pagination import PageNumberPagination
-from django.core.mail import send_mail
+from django.db import IntegrityError
+from django.db import transaction
 from django.conf import settings as django_settings
+from django.contrib.auth.hashers import make_password
+from django.utils import timezone
+import base64
+import json
+
+from accounts.sendgrid_email import send_otp_email
+
+from accounts.google_token import verify_google_token, audience_matches_config
+
+
+def _jwt_payload_unverified(token):
+    """Decode JWT payload only for logging (does not verify signature)."""
+    try:
+        parts = token.split('.')
+        if len(parts) != 3:
+            return {}
+        pad = '=' * ((4 - len(parts[1]) % 4) % 4)
+        raw = base64.urlsafe_b64decode(parts[1] + pad)
+        return json.loads(raw.decode('utf-8'))
+    except Exception:
+        return {}
 
 
 class TestAPIView(APIView):
@@ -22,29 +46,44 @@ class TestAPIView(APIView):
         })
 
 
-def _send_otp_email(email, otp):
-    """Send OTP verification email."""
+def _redact_register_data(data):
+    """For safe logging (works with QueryDict / dict)."""
+    out = {}
     try:
-        send_mail(
-            subject='CivicTrack — Email Verification OTP',
-            message=(
-                f'Your OTP for CivicTrack email verification is: {otp}\n\n'
-                f'This OTP is valid for 10 minutes.\n'
-                f'Do not share this OTP with anyone.'
-            ),
-            from_email=django_settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[email],
-            fail_silently=False,
-        )
-        return True
-    except Exception as e:
-        print(f'Email send error: {e}')
-        return False
+        for key in data:
+            out[key] = data.get(key)
+    except Exception:
+        return {}
+    for k in list(out.keys()):
+        lk = str(k).lower()
+        if 'password' in lk or 'otp' in lk:
+            out[k] = '***'
+    return out
+
+
+def _serializer_errors_message(errors):
+    """Single human-readable line from DRF errors."""
+    if isinstance(errors, dict):
+        parts = []
+        for key, val in errors.items():
+            if isinstance(val, list):
+                parts.append(f'{key}: {val[0]}' if val else key)
+            elif isinstance(val, dict):
+                parts.append(_serializer_errors_message(val))
+            else:
+                parts.append(f'{key}: {val}')
+        return '; '.join(parts) if parts else 'Validation failed.'
+    if isinstance(errors, list):
+        return errors[0] if errors else 'Validation failed.'
+    return str(errors)
 
 
 class LoginView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
     def post(self, request):
-        email = request.data.get('email')
+        email = (request.data.get('email') or '').strip().lower()
         password = request.data.get('password')
 
         if not email or not password:
@@ -54,7 +93,7 @@ class LoginView(APIView):
             )
 
         try:
-            user = CustomUser.objects.get(email=email)
+            user = CustomUser.objects.get(email__iexact=email)
             if user.check_password(password):
                 if not user.is_active:
                     return Response(
@@ -63,9 +102,10 @@ class LoginView(APIView):
                     )
                 # Block login if email not verified
                 if not user.email_verified:
-                    # Resend OTP so they can verify
-                    otp = EmailOTP.generate(user)
-                    _send_otp_email(user.email, otp)
+                    new_otp = str(random.randint(100000, 999999))
+                    user.otp = new_otp
+                    user.save(update_fields=['otp'])
+                    send_otp_email(user.email, new_otp)
                     return Response(
                         {
                             'success': False,
@@ -97,121 +137,247 @@ class LoginView(APIView):
             )
 
 class RegisterView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
     def post(self, request):
-        username = request.data.get('username')
-        email = request.data.get('email')
-        password = request.data.get('password')
-        role = request.data.get('role', 'Civic-User')
+        logger = logging.getLogger(__name__)
+        logger.info('Register request (redacted): %s', _redact_register_data(request.data))
 
-        if CustomUser.objects.filter(email=email).exists():
-            return Response({'success': False, 'message': 'Email already exists'}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = UserRegister(data=request.data)
+        if not serializer.is_valid():
+            msg = _serializer_errors_message(serializer.errors)
+            logger.warning('Register validation failed: %s', serializer.errors)
+            return Response(
+                {
+                    'success': False,
+                    'message': msg,
+                    'errors': serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        if username and CustomUser.objects.filter(username=username).exists():
-            return Response({'success': False, 'message': 'Username already exists'}, status=status.HTTP_400_BAD_REQUEST)
+        validated = dict(serializer.validated_data)
+        email = (validated.get('email') or '').strip().lower()
+        username = (validated.get('username') or '').strip()
+        role = validated.get('User_Role') or 'Civic-User'
+        raw_password = validated.get('password') or ''
 
-        user = CustomUser.objects.create_user(
-            email=email,
-            password=password,
-            username=username or email.split('@')[0],
-            User_Role=role,
-            email_verified=False,
+        # Cleanup expired pending rows opportunistically.
+        PendingUser.objects.filter(updated_at__lt=timezone.now() - timedelta(minutes=10)).delete()
+
+        if CustomUser.objects.filter(email=email).exists() or CustomUser.objects.filter(username=username).exists():
+            return Response(
+                {
+                    'success': False,
+                    'message': 'Email or username is already registered.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        otp = str(random.randint(100000, 999999))
+        try:
+            PendingUser.objects.update_or_create(
+                email=email,
+                defaults={
+                    'username': username,
+                    'password_hash': make_password(raw_password),
+                    'user_role': role,
+                    'otp': otp,
+                },
+            )
+        except IntegrityError as e:
+            logger.warning('Pending signup integrity error: %s', e)
+            return Response(
+                {
+                    'success': False,
+                    'message': 'Email or username is already registered.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.exception('Pending signup failed: %s', e)
+            return Response(
+                {
+                    'success': False,
+                    'message': 'Could not start signup. Please try again.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        print('OTP:', otp)
+        print('Sending to:', email)
+        send_otp_email(email, otp)
+
+        return Response(
+            {
+                'success': True,
+                'message': 'Signup started. OTP sent to email',
+                'email': email,
+                'otp_sent': True,
+                'requires_verification': True,
+            },
+            status=status.HTTP_201_CREATED,
         )
 
-        # Create Officer record if role is Officer
-        try:
-            if role == 'Officer':
-                from departments.models import Officer as DeptOfficer
-                officer_id = f"OFF{user.id}"
-                DeptOfficer.objects.create(
-                    officer_id=officer_id,
-                    name=user.get_full_name() or user.username,
-                    email=user.email,
-                    phone=getattr(user, 'mobile_number', '') or ''
-                )
-        except Exception:
-            pass
-
-        # Generate and send OTP
-        otp = EmailOTP.generate(user)
-        sent = _send_otp_email(email, otp)
-
-        return Response({
-            'success': True,
-            'message': 'Registration successful. Please check your email for the OTP to verify your account.',
-            'email': email,
-            'otp_sent': sent,
-            'requires_verification': True,
-        }, status=status.HTTP_201_CREATED)
-
 class VerifyEmailOTP(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
     def post(self, request):
         email = request.data.get('email', '').strip().lower()
-        otp   = request.data.get('otp', '').strip()
+        otp = (request.data.get('otp') or '').strip().replace(' ', '')
 
         if not email or not otp:
             return Response({'success': False, 'message': 'Email and OTP are required'}, status=400)
 
-        try:
-            user = CustomUser.objects.get(email=email)
-        except CustomUser.DoesNotExist:
-            return Response({'success': False, 'message': 'User not found'}, status=404)
+        # Cleanup expired pending rows first.
+        PendingUser.objects.filter(updated_at__lt=timezone.now() - timedelta(minutes=10)).delete()
 
-        if user.email_verified:
-            # Already verified — just log them in
+        # Already-created user path (legacy compatibility).
+        existing_user = CustomUser.objects.filter(email=email).first()
+        if existing_user and existing_user.email_verified:
+            refresh = RefreshToken.for_user(existing_user)
+            return Response({
+                'success': True,
+                'message': 'Email verified successfully',
+                'access_token': str(refresh.access_token),
+                'refresh_token': str(refresh),
+                'user': {'email': existing_user.email, 'username': existing_user.username, 'name': existing_user.get_full_name() or existing_user.email, 'role': existing_user.User_Role}
+            })
+
+        # New pending signup path (user is created only after OTP success).
+        pending = PendingUser.objects.filter(email=email).first()
+        if pending:
+            if not pending.is_valid():
+                pending.delete()
+                return Response(
+                    {'success': False, 'error': 'Invalid OTP', 'message': 'OTP expired. Please signup again.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if (pending.otp or '').strip() != otp:
+                return Response(
+                    {'success': False, 'error': 'Invalid OTP', 'message': 'Invalid OTP'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if CustomUser.objects.filter(email=email).exists():
+                pending.delete()
+                return Response({'success': False, 'message': 'Email is already registered'}, status=400)
+
+            if CustomUser.objects.filter(username=pending.username).exists():
+                pending.username = f"{pending.username}_{random.randint(1000, 9999)}"
+                pending.save(update_fields=['username'])
+
+            with transaction.atomic():
+                user = CustomUser.objects.create(
+                    username=pending.username,
+                    email=pending.email,
+                    password=pending.password_hash,  # already hashed at signup
+                    User_Role=pending.user_role,
+                    is_verified=True,
+                    email_verified=True,
+                    otp=None,
+                )
+                pending.delete()
+
+                if user.User_Role == 'Officer':
+                    try:
+                        from departments.models import Officer as DeptOfficer
+                        officer_id = f"OFF{user.id}"
+                        DeptOfficer.objects.get_or_create(
+                            officer_id=officer_id,
+                            defaults={
+                                'name': user.get_full_name() or user.username,
+                                'email': user.email,
+                                'phone': getattr(user, 'mobile_number', '') or '',
+                            },
+                        )
+                    except Exception:
+                        pass
+
             refresh = RefreshToken.for_user(user)
             return Response({
                 'success': True,
-                'message': 'Email already verified.',
+                'message': 'Email verified successfully',
                 'access_token': str(refresh.access_token),
                 'refresh_token': str(refresh),
                 'user': {'email': user.email, 'username': user.username, 'name': user.get_full_name() or user.email, 'role': user.User_Role}
             })
 
-        try:
-            record = EmailOTP.objects.get(user=user)
-        except EmailOTP.DoesNotExist:
-            return Response({'success': False, 'message': 'OTP not found. Please request a new one.'}, status=400)
+        # Legacy unverified user path (existing DB users from earlier flow).
+        if existing_user:
+            stored = (existing_user.otp or '').strip()
+            if not stored:
+                return Response(
+                    {
+                        'success': False,
+                        'error': 'Invalid OTP',
+                        'message': 'No OTP on file. Use resend to get a new code.',
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if stored != otp:
+                return Response(
+                    {'success': False, 'error': 'Invalid OTP', 'message': 'Invalid OTP'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        if not record.is_valid():
-            return Response({'success': False, 'message': 'OTP has expired. Please request a new one.'}, status=400)
+            existing_user.is_verified = True
+            existing_user.email_verified = True
+            existing_user.otp = None
+            existing_user.save(update_fields=['is_verified', 'email_verified', 'otp'])
 
-        if record.otp != otp:
-            return Response({'success': False, 'message': 'Invalid OTP. Please try again.'}, status=400)
+            refresh = RefreshToken.for_user(existing_user)
+            return Response({
+                'success': True,
+                'message': 'Email verified successfully',
+                'access_token': str(refresh.access_token),
+                'refresh_token': str(refresh),
+                'user': {'email': existing_user.email, 'username': existing_user.username, 'name': existing_user.get_full_name() or existing_user.email, 'role': existing_user.User_Role}
+            })
 
-        # Mark verified
-        user.email_verified = True
-        user.save(update_fields=['email_verified'])
-        record.delete()
-
-        refresh = RefreshToken.for_user(user)
-        return Response({
-            'success': True,
-            'message': 'Email verified successfully! Welcome to CivicTrack.',
-            'access_token': str(refresh.access_token),
-            'refresh_token': str(refresh),
-            'user': {'email': user.email, 'username': user.username, 'name': user.get_full_name() or user.email, 'role': user.User_Role}
-        })
+        return Response({'success': False, 'message': 'User not found'}, status=404)
 
 
 class ResendOTP(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
     def post(self, request):
         email = request.data.get('email', '').strip().lower()
         if not email:
             return Response({'success': False, 'message': 'Email is required'}, status=400)
-        try:
-            user = CustomUser.objects.get(email=email)
-        except CustomUser.DoesNotExist:
+
+        PendingUser.objects.filter(updated_at__lt=timezone.now() - timedelta(minutes=10)).delete()
+
+        pending = PendingUser.objects.filter(email=email).first()
+        if pending:
+            new_otp = str(random.randint(100000, 999999))
+            pending.otp = new_otp
+            pending.save(update_fields=['otp', 'updated_at'])
+            send_otp_email(email, new_otp)
+            return Response({
+                'success': True,
+                'message': 'A new OTP has been sent to your email.',
+                'otp_sent': True,
+            })
+
+        user = CustomUser.objects.filter(email=email).first()
+        if not user:
             return Response({'success': False, 'message': 'No account found with this email'}, status=404)
 
         if user.email_verified:
             return Response({'success': False, 'message': 'Email is already verified'}, status=400)
 
-        otp  = EmailOTP.generate(user)
-        sent = _send_otp_email(email, otp)
+        new_otp = str(random.randint(100000, 999999))
+        user.otp = new_otp
+        user.save(update_fields=['otp'])
+        send_otp_email(email, new_otp)
         return Response({
             'success': True,
-            'message': 'A new OTP has been sent to your email.' if sent else 'OTP generated but email could not be sent. Check server email config.',
-            'otp_sent': sent,
+            'message': 'A new OTP has been sent to your email.',
+            'otp_sent': True,
         })
 
 
@@ -229,49 +395,179 @@ class LogoutView(APIView):
             return Response({'success': True, 'message': 'Logged out successfully'}, status=status.HTTP_200_OK)
 
 class GoogleLoginView(APIView):
+    """Exchange Google ID token for app JWT. No Authorization header required."""
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
     def post(self, request):
-        token = request.data.get('token')
-        
+        logger = logging.getLogger(__name__)
+        origin = request.META.get('HTTP_ORIGIN', '')
+        logger.info('Google login request origin=%s', origin)
+
+        token = request.data.get('token') or request.data.get('id_token') or request.data.get('credential')
+
+        if not token:
+            logger.warning('No token provided in request')
+            return Response({
+                'success': False,
+                'message': 'Google token is required',
+                'error_code': 'MISSING_TOKEN',
+                'details': 'Please ensure you are logged in with Google and try again.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        expected_client_id = getattr(django_settings, 'GOOGLE_CLIENT_ID', '') or ''
+        if not expected_client_id:
+            logger.error('GOOGLE_CLIENT_ID is empty in Django settings')
+            return Response({
+                'success': False,
+                'message': 'Google login not configured. Please contact administrator.',
+                'error_code': 'CONFIGURATION_ERROR',
+                'details': 'Set GOOGLE_CLIENT_ID in the environment to your Web client ID.',
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        unverified = _jwt_payload_unverified(token)
+        token_aud = unverified.get('aud')
+        logger.info(
+            'Google token aud (JWT payload, unverified)=%s iss=%s expected_client_id=%s',
+            token_aud,
+            unverified.get('iss'),
+            expected_client_id,
+        )
+
         try:
-            GOOGLE_CLIENT_ID = '368010718950-mpbp3m0379j51abunusi6n1o2jtnq715.apps.googleusercontent.com'
-            idinfo = id_token.verify_oauth2_token(token, requests.Request(), GOOGLE_CLIENT_ID)
-            
+            idinfo = verify_google_token(token)
+
+            if not audience_matches_config(idinfo):
+                logger.warning(
+                    'Audience mismatch after verify: idinfo[aud]=%r settings.GOOGLE_CLIENT_ID=%r',
+                    idinfo.get('aud'),
+                    expected_client_id,
+                )
+                return Response({
+                    'success': False,
+                    'message': 'Invalid Google token: Audience mismatch',
+                    'error_code': 'AUDIENCE_MISMATCH',
+                    'details': (
+                        f'Token aud={idinfo.get("aud")!r} must equal '
+                        f'settings.GOOGLE_CLIENT_ID={expected_client_id!r}.'
+                    ),
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Extract user information safely
             email = idinfo.get('email')
             name = idinfo.get('name')
+            picture = idinfo.get('picture')
             
+            logger.info(f'Token verified for email: {email}')
+            
+            # Email validation
+            if not email:
+                logger.error('No email found in Google token')
+                return Response({
+                    'success': False,
+                    'message': 'Invalid Google token: Email not found',
+                    'error_code': 'INVALID_EMAIL',
+                    'details': 'The Google token does not contain a valid email address.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Check if user exists and is active
+            try:
+                existing_user = CustomUser.objects.get(email=email)
+                if existing_user and not existing_user.is_active:
+                    logger.warning(f'User {email} exists but is not active')
+                    return Response({
+                        'success': False,
+                        'message': 'Account is deactivated. Please contact administrator.',
+                        'error_code': 'ACCOUNT_DEACTIVATED',
+                        'details': 'Your account has been deactivated. Please contact support.'
+                    }, status=status.HTTP_403_FORBIDDEN)
+            except CustomUser.DoesNotExist:
+                pass  # User doesn't exist, will create new one
+            
+            # Get or create user with proper defaults (CustomUser has no profile_picture field)
             user, created = CustomUser.objects.get_or_create(
                 email=email,
                 defaults={
-                    'username': email.split('@')[0],
-                    'first_name': name.split()[0] if name else '',
-                    'last_name': ' '.join(name.split()[1:]) if name and len(name.split()) > 1 else '',
-                    'User_Role': 'Civic-User'
+                    'username': email.split('@')[0][:150],  # Limit username length
+                    'first_name': name.split()[0][:50] if name else '',
+                    'last_name': ' '.join(name.split()[1:3])[:50] if name and len(name.split()) > 1 else '',  # Limit last name length
+                    'User_Role': 'Civic-User',
+                    'is_active': True,
+                    'email_verified': True,
+                    'is_verified': True,
                 }
             )
+            if created:
+                user.set_unusable_password()
+                user.save(update_fields=['password'])
+
+            logger.info(f'User {"created" if created else "retrieved"}: {user.email}')
             
+            # Generate JWT tokens
             refresh = RefreshToken.for_user(user)
+            access_str = str(refresh.access_token)
+            refresh_str = str(refresh)
             
+            logger.info(f'JWT tokens generated for user: {user.email}')
+            
+            # Success response with complete user data
             return Response({
                 'success': True,
-                'access_token': str(refresh.access_token),
-                'refresh_token': str(refresh),
+                # SimpleJWT-style keys (for clients expecting access / refresh)
+                'access': access_str,
+                'refresh': refresh_str,
+                # Legacy keys (existing frontend)
+                'access_token': access_str,
+                'refresh_token': refresh_str,
                 'user': {
+                    'id': user.id,
                     'email': user.email,
                     'username': user.username,
-                    'name': user.get_full_name() or user.email,
-                    'role': user.User_Role
-                }
+                    'first_name': user.first_name,
+                    'last_name': user.last_name,
+                    'name': user.get_full_name(),
+                    'role': user.User_Role,
+                    'profile_picture': picture or '',
+                    'is_new_user': created
+                },
+                'message': 'Login successful'
             }, status=status.HTTP_200_OK)
             
-        except ValueError:
-            return Response({
-                'success': False,
-                'message': 'Invalid Google token'
-            }, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as e:
+            logger.error('Google token validation error: %s', str(e))
+            error_message = str(e)
+            if 'audience' in error_message.lower():
+                return Response({
+                    'success': False,
+                    'message': 'Invalid Google token: Audience mismatch',
+                    'error_code': 'AUDIENCE_MISMATCH',
+                    'details': (
+                        f'Token aud (from JWT)={token_aud!r} must match '
+                        f'settings.GOOGLE_CLIENT_ID={expected_client_id!r} (same as NEXT_PUBLIC_GOOGLE_CLIENT_ID).'
+                    ),
+                }, status=status.HTTP_400_BAD_REQUEST)
+            elif 'expired' in error_message.lower():
+                return Response({
+                    'success': False,
+                    'message': 'Google token has expired',
+                    'error_code': 'TOKEN_EXPIRED',
+                    'details': 'Please try logging in with Google again.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                return Response({
+                    'success': False,
+                    'message': f'Invalid Google token: {str(e)}',
+                    'error_code': 'INVALID_TOKEN',
+                    'details': 'The Google token is invalid or malformed.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
         except Exception as e:
+            logger.error(f'Google login error: {str(e)}', exc_info=True)
             return Response({
                 'success': False,
-                'message': str(e)
+                'message': 'Google login failed. Please try again.',
+                'error_code': 'INTERNAL_ERROR',
+                'details': 'An internal server error occurred. Please try again later.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class UserDetail(APIView):

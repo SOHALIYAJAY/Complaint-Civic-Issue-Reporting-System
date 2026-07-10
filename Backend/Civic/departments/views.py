@@ -3,7 +3,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.generics import ListAPIView
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.db.models import Q, Count
 from django.utils import timezone
 from datetime import timedelta
@@ -13,7 +13,7 @@ from complaints.models import Complaint
 from complaints.serializers import ComplaintSerializer
 from accounts.models import CustomUser
 from departments.models import Department, Officer
-from departments.serializers import deptSerializer, OfficerSerializer
+from departments.serializers import deptSerializer, OfficerSerializer, DepartmentDropdownSerializer
 from rest_framework import status
 
 
@@ -34,19 +34,35 @@ def _get_user_department(user):
 def _dept_complaint_qs(dept):
     """
     Return complaints scoped to a department.
-    Matches on Category.name (full display name e.g. 'Water Supply')
-    OR Category.code (dept category code e.g. 'WATER') OR Category.department.
+    Matches on Category.name (full display name e.g. 'Water Supply'),
+    Department.name (custom title), Category.code, or Category.department code.
     """
     dept_label = dept.get_category_display()   # e.g. 'Water Supply'
     dept_code  = dept.category                 # e.g. 'WATER'
-    return Complaint.objects.filter(
-        Q(Category__name=dept_label) |
-        Q(Category__code=dept_code) |
-        Q(Category__department=dept_code)
+    dept_name  = (dept.name or '').strip()
+    q = (
+        Q(Category__name=dept_label)
+        | Q(Category__code=dept_code)
+        | Q(Category__department=dept_code)
     )
+    if dept_name:
+        q |= Q(Category__name=dept_name)
+    return Complaint.objects.filter(q)
 
 
 # ─── Public department list (no auth — used by raise-complaint form) ─────────
+
+
+class DepartmentListView(APIView):
+    """GET /api/departments/ — `[{id, name}, ...]`; name is the display label used by complaint create."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        departments = Department.objects.all().order_by('name')
+        return Response(DepartmentDropdownSerializer(departments, many=True).data)
+
 
 @api_view(['GET'])
 def department_list_public(request):
@@ -84,7 +100,7 @@ def department_statistics(request):
         year = int(year_param) if year_param and year_param.isdigit() else None
 
         departments_data = []
-        for dept in Department.objects.all():
+        for dept in Department.objects.all().order_by('name'):
             base_qs = _dept_complaint_qs(dept)
             if year:
                 base_qs = base_qs.filter(current_time__year=year)
@@ -93,7 +109,11 @@ def department_statistics(request):
             pending_count    = base_qs.filter(status='Pending').count()
             inprogress_count = base_qs.filter(status='In Process').count()
             resolved_count   = base_qs.filter(status='Completed').count()
-            officer_count    = base_qs.exclude(officer_id=None).values('officer_id').distinct().count()
+            # Officer graph should include all officers in the department, even with 0 complaints.
+            # Combine both links: Department.officers (CustomUser M2M) and Officer FK rows.
+            m2m_user_count = dept.officers.count()
+            officer_fk_count = Officer.objects.filter(department=dept).count()
+            officer_count = max(m2m_user_count, officer_fk_count)
             resolution_rate  = round(resolved_count / complaint_count * 100, 1) if complaint_count else 0
 
             departments_data.append({
@@ -159,6 +179,14 @@ class OfficerDetail(ListAPIView):
 
     def list(self, request, *args, **kwargs):
         officers = Officer.objects.select_related('department').all()
+
+        # Security: department users can only view officers from their own department.
+        if getattr(request.user, 'User_Role', None) == 'Department-User':
+            dept = _get_user_department(request.user)
+            if not dept:
+                return Response([])
+            officers = officers.filter(department=dept)
+
         result = []
         for o in officers:
             dept_name = o.department.name if o.department else ''
@@ -231,28 +259,8 @@ def department_officers(request):
     try:
         dept = _get_user_department(request.user)
 
-        # Fallback: return all available officers when no department is linked
         if not dept:
-            officers_qs = Officer.objects.filter(is_available=True) or Officer.objects.all()
-            data = []
-            for o in officers_qs:
-                handled  = Complaint.objects.filter(officer_id=o.officer_id).count()
-                resolved = Complaint.objects.filter(officer_id=o.officer_id, status='Completed').count()
-                data.append({
-                    'id': o.officer_id,
-                    'name': o.name,
-                    'email': o.email,
-                    'phone': getattr(o, 'phone', 'Not Available'),
-                    'role': 'Officer',
-                    'department': None,
-                    'status': 'Active' if o.is_available else 'Inactive',
-                    'joinedDate': None,
-                    'totalComplaintsHandled': handled,
-                    'avgResolutionTime': 0,
-                    'satisfactionRate': 85.0,
-                    'performanceScore': round(min(100, (resolved / max(1, handled) * 50) + 42.5)),
-                })
-            return Response(data)
+            return Response({'error': 'No department found for this user'}, status=status.HTTP_404_NOT_FOUND)
 
         # Officers that belong to this department (M2M via CustomUser)
         dept_user_officers = dept.officers.all()
@@ -327,7 +335,9 @@ def department_officers(request):
 def department_complaints(request):
     try:
         dept = _get_user_department(request.user)
-        qs = _dept_complaint_qs(dept).order_by('-current_time') if dept else Complaint.objects.all().order_by('-current_time')
+        if not dept:
+            return Response({'error': 'No department found for this user'}, status=status.HTTP_404_NOT_FOUND)
+        qs = _dept_complaint_qs(dept).order_by('-current_time')
 
         data = []
         for c in qs:
@@ -461,29 +471,23 @@ def department_dashboard(request):
         user = request.user
         dept = _get_user_department(user)
 
-        if dept:
-            qs           = _dept_complaint_qs(dept)
-            dept_name    = dept.get_category_display()
-            dept_code    = dept.category
-            dept_email   = dept.contact_email
-            dept_phone   = dept.contact_phone
-            head_name    = dept.head_officer.get_full_name() if dept.head_officer else 'Not Assigned'
-            dept_officers_count = dept.officers.count()
-        else:
-            qs           = Complaint.objects.all()
-            dept_name    = 'All Departments'
-            dept_code    = ''
-            dept_email   = ''
-            dept_phone   = ''
-            head_name    = 'N/A'
-            dept_officers_count = Officer.objects.count()
+        if not dept:
+            return Response({'error': 'No department found for this user'}, status=status.HTTP_404_NOT_FOUND)
+
+        qs           = _dept_complaint_qs(dept)
+        dept_name    = dept.get_category_display()
+        dept_code    = dept.category
+        dept_email   = dept.contact_email
+        dept_phone   = dept.contact_phone
+        head_name    = dept.head_officer.get_full_name() if dept.head_officer else 'Not Assigned'
+        dept_officers_count = dept.officers.count()
 
         total      = qs.count()
         pending    = qs.filter(status='Pending').count()
         inprogress = qs.filter(status='In Process').count()
         resolved   = qs.filter(status='Completed').count()
 
-        all_officers    = Officer.objects.filter(department=dept) if dept else Officer.objects.all()
+        all_officers    = Officer.objects.filter(department=dept)
         active_officers = all_officers.filter(is_available=True).count()
         inactive_officers = all_officers.filter(is_available=False).count()
 

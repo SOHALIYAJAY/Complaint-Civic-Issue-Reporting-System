@@ -1,12 +1,14 @@
 from django.db import models
+import uuid
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from departments.models import Officer
 from Categories.models import Category
-from accounts.admin import CustomUser
+from accounts.models import CustomUser
 
 User = get_user_model()
 class Complaint(models.Model):
+    complaint_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     CHOICE_PRIORITY=(
         ('Low','Low'),
@@ -24,7 +26,7 @@ class Complaint(models.Model):
     officer_id=models.ForeignKey(Officer, null=True, blank=True, on_delete=models.SET_NULL, related_name='assigned_complaints')
     Category=models.ForeignKey(Category, null=True, blank=True, on_delete=models.CASCADE, related_name='complaints')
     Description=models.CharField(max_length=300)
-    image_video=models.FileField(upload_to='media/', null=True, blank=True)
+    image_video = models.URLField(max_length=500, null=True, blank=True)
     location_address=models.CharField(max_length=200)
     location_District=models.CharField(max_length=100)
     location_taluk=models.CharField(max_length=100)
@@ -38,6 +40,8 @@ class Complaint(models.Model):
     
     def __str__(self):
         return f"{self.title} - {self.Category}"
+    
+
 
 class ComplaintAssignment(models.Model):
     PRIORITY_CHOICES = [

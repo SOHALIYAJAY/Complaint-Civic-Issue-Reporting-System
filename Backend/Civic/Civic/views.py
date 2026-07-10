@@ -2,13 +2,24 @@ from django.shortcuts import render
 from django.http import JsonResponse
 import traceback
 import math
+import re
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView, CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.parsers import MultiPartParser, FormParser
+from django.core.mail import send_mail
+from django.http import JsonResponse
+from django.conf import settings
+
+
+def health_check(request):
+    """Simple health endpoint for uptime monitors."""
+    return JsonResponse({"status": "ok"})
+
 
 class StandardResultsSetPagination(PageNumberPagination):
     # Default items per page
@@ -53,6 +64,26 @@ from complaints.models import ComplaintAssignment
 import calendar
 from datetime import datetime, timedelta
 from django.utils import timezone
+
+
+def _get_user_department(user):
+    if hasattr(user, 'headed_department') and user.headed_department.exists():
+        return user.headed_department.first()
+    if hasattr(user, 'departments') and user.departments.exists():
+        return user.departments.first()
+    return None
+
+
+def _complaint_belongs_to_department(complaint, dept):
+    if not complaint or not complaint.Category or not dept:
+        return False
+    dept_code = dept.category
+    dept_label = dept.get_category_display()
+    return (
+        complaint.Category.department == dept_code
+        or complaint.Category.code == dept_code
+        or complaint.Category.name == dept_label
+    )
 
 
 class getcomplaint(ListAPIView):
@@ -118,7 +149,7 @@ def recent_complaints_admin(request):
         recent_complaints = Complaint.objects.all().order_by('-current_time')[:6]
         
         # Serialize the complaints
-        serializer = ComplaintSerializer(recent_complaints, many=True)
+        serializer = ComplaintSerializer(recent_complaints, many=True, context={'request': request})
         
         return Response({
             'success': True,
@@ -139,17 +170,34 @@ class compinfo(APIView):
     
     def get(self,request):
         total_comp = Complaint.objects.filter(user=self.request.user).count()
-        resolved_comp = Complaint.objects.filter(status='Completed', user=self.request.user).count()
-        pending_comp = Complaint.objects.filter(status='Pending', user=self.request.user).count()
-        In_progress_comp = Complaint.objects.filter(status='In Process', user=self.request.user).count()
+        resolved_comp = Complaint.objects.filter(
+            user=self.request.user
+        ).filter(
+            Q(status__iexact='Completed') | Q(status__iexact='resolved')
+        ).count()
+        pending_comp = Complaint.objects.filter(status__iexact='Pending', user=self.request.user).count()
+        In_progress_comp = Complaint.objects.filter(
+            user=self.request.user
+        ).filter(
+            Q(status__iexact='In Process') | Q(status__iexact='in_progress') | Q(status__iexact='in-progress')
+        ).count()
         total_categories = Category.objects.all().count()
+        total_users = CustomUser.objects.all().count()
+        total_departments = Department.objects.all().count()
+        sla = (resolved_comp / total_comp * 100) if total_comp > 0 else 0
         return Response({
             'total_complaints': total_comp,
             'Resolved_complaints': resolved_comp,
             'Pending_complaints': pending_comp,
-            'SLA_complaince': (resolved_comp / total_comp * 100) if total_comp > 0 else 0,
+            'SLA_complaince': sla,
             'in_progress_complaints': In_progress_comp,
-            'total_categories': total_categories
+            'total_categories': total_categories,
+            # Backward-compatible normalized keys for newer clients:
+            'resolved_complaints': resolved_comp,
+            'pending_complaints': pending_comp,
+            'sla_compliance': round(sla, 1),
+            'total_users': total_users,
+            'total_departments': total_departments,
         })
 
 
@@ -158,9 +206,13 @@ class complaintinfo(APIView):
         try:
             # Get overall statistics for public display
             total_comp = Complaint.objects.all().count()
-            resolved_comp = Complaint.objects.filter(status='Completed').count()
-            pending_comp = Complaint.objects.filter(status='Pending').count()
-            in_progress_comp = Complaint.objects.filter(status='In Process').count()
+            resolved_comp = Complaint.objects.filter(
+                Q(status__iexact='Completed') | Q(status__iexact='resolved')
+            ).count()
+            pending_comp = Complaint.objects.filter(status__iexact='Pending').count()
+            in_progress_comp = Complaint.objects.filter(
+                Q(status__iexact='In Process') | Q(status__iexact='in_progress') | Q(status__iexact='in-progress')
+            ).count()
             total_categories = Category.objects.all().count()
             total_users = CustomUser.objects.all().count()
             total_departments = Department.objects.all().count()
@@ -185,13 +237,98 @@ class complaintinfo(APIView):
             }, status=500)
 
 
+class UserStatsView(APIView):
+    """
+    Home-page statistics scoped to the logged-in user (role-based).
+    Citizen: own complaints; Officer: assigned complaints; Department: department complaints;
+    Admin-User: global counts (same as public totals for complaints).
+    GET /api/user/stats/
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from departments.models import Officer as OfficerModel, Department
+        from departments.views import _get_user_department, _dept_complaint_qs
+
+        user = request.user
+        role = getattr(user, 'User_Role', None) or ''
+
+        if role == 'Admin-User':
+            qs = Complaint.objects.all()
+        elif role == 'Civic-User':
+            qs = Complaint.objects.filter(user=user)
+        elif role == 'Department-User':
+            dept = _get_user_department(user)
+            qs = _dept_complaint_qs(dept) if dept else Complaint.objects.none()
+        elif role == 'Officer':
+            email = (getattr(user, 'email', None) or '').strip()
+            off = OfficerModel.objects.filter(email__iexact=email).first() if email else None
+            if not off:
+                off = OfficerModel.objects.filter(officer_id=f'OFF{user.id}').first()
+            if not off and getattr(user, 'username', None):
+                off = OfficerModel.objects.filter(officer_id=user.username).first()
+            qs = Complaint.objects.filter(officer_id=off) if off else Complaint.objects.none()
+        else:
+            qs = Complaint.objects.filter(user=user)
+
+        total = qs.count()
+        resolved = qs.filter(
+            Q(status__iexact='Completed') | Q(status__iexact='resolved')
+        ).count()
+        pending = qs.filter(status__iexact='Pending').count()
+
+        sla = round((resolved / total) * 100, 1) if total > 0 else 0.0
+
+        categories = Department.objects.count()
+        users_count = CustomUser.objects.count()
+
+        return Response({
+            'total': total,
+            'resolved': resolved,
+            'pending': pending,
+            'sla': sla,
+            'categories': categories,
+            'users': users_count,
+        })
+
+
+class GlobalStatsView(APIView):
+    """
+    GET /api/stats/ — system-wide platform statistics for the public home page.
+    Uses the same status rules as complaintinfo (Completed/Pending; case-insensitive aliases).
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        total_complaints = Complaint.objects.count()
+        resolved = Complaint.objects.filter(
+            Q(status__iexact='Completed') | Q(status__iexact='resolved')
+        ).count()
+        pending = Complaint.objects.filter(status__iexact='Pending').count()
+        categories = Department.objects.count()
+        users_count = CustomUser.objects.count()
+        sla = round((resolved / total_complaints) * 100, 1) if total_complaints > 0 else 0.0
+
+        return Response({
+            'total_complaints': total_complaints,
+            'resolved': resolved,
+            'pending': pending,
+            'sla': sla,
+            'categories': categories,
+            'users': users_count,
+        })
+
+
 @api_view(['GET'])
 def complaintDetails(request, pk):
     try:
         compdetail = Complaint.objects.get(pk=pk)
     except Complaint.DoesNotExist:
         return Response({'error': 'Complaint not found'}, status=status.HTTP_404_NOT_FOUND)
-    serializer = ComplaintSerializer(compdetail)
+    serializer = ComplaintSerializer(compdetail, context={'request': request})
     return Response({'compdetail': serializer.data})
 
 
@@ -388,11 +525,6 @@ class complaintinfo(APIView):
         return Response({"total_comp": total_comp})
 
 
-class DepartmentList(ListAPIView):
-    queryset = Department.objects.all()
-    serializer_class = deptSerializer
-
-
 class complaintofficer(CreateAPIView):
     queryset = ComplaintAssignment.objects.all()
     serializer_class = ComplaintAssignmentSerializer
@@ -404,6 +536,26 @@ class complaintofficer(CreateAPIView):
             m = re.search(r"(\d+)", str(comp_val))
             if m:
                 data['complaint'] = int(m.group(1))
+
+        # Department user security: cannot assign outside own department.
+        if getattr(request.user, 'User_Role', None) == 'Department-User':
+            dept = _get_user_department(request.user)
+            if not dept:
+                return Response({'error': 'No department found for this user'}, status=status.HTTP_403_FORBIDDEN)
+
+            complaint_id = data.get('complaint')
+            officer_id = data.get('officer')
+            complaint = Complaint.objects.filter(id=complaint_id).select_related('Category').first()
+            officer = Officer.objects.filter(pk=officer_id).first() if officer_id else None
+
+            if not complaint:
+                return Response({'error': 'Complaint not found'}, status=status.HTTP_404_NOT_FOUND)
+            if not _complaint_belongs_to_department(complaint, dept):
+                return Response({'error': 'Cannot assign complaints outside your department'}, status=status.HTTP_403_FORBIDDEN)
+            if not officer:
+                return Response({'error': 'Officer not found'}, status=status.HTTP_404_NOT_FOUND)
+            if officer.department_id != dept.id:
+                return Response({'error': 'Cannot assign outside department'}, status=status.HTTP_403_FORBIDDEN)
 
         serializer = self.get_serializer(data=data)
         try:
@@ -429,7 +581,7 @@ class officerprofile(APIView):
             in_progress_comp = Complaint.objects.filter(officer_id=officer_id, status='In Process').count()
 
             assigned_complaints = Complaint.objects.filter(officer_id=officer_id)
-            complaints_serializer = ComplaintSerializer(assigned_complaints, many=True)
+            complaints_serializer = ComplaintSerializer(assigned_complaints, many=True, context={'request': request})
 
             return Response({
                 'officer': officer_serializer.data,
@@ -444,16 +596,47 @@ class officerprofile(APIView):
 
 
 class officerkpi(APIView):
+    """
+    KPIs for officers list pages. Admin users see system-wide counts.
+    Department-User and Officer roles see counts scoped to their department.
+    Officer model uses is_available for active vs inactive.
+    """
+
     def get(self, request):
-        total_officers = Officer.objects.all().count()
-        active_officers = Officer.objects.filter(is_available=True).count()
-        total_assigned = Complaint.objects.exclude(officer_id=None).count()
-        resolved_comp = Complaint.objects.filter(status='Completed').count()
-        total_comp = Complaint.objects.all().count()
+        from departments.views import _get_user_department
+
+        user = getattr(request, 'user', None)
+        dept = None
+        if user and getattr(user, 'is_authenticated', False):
+            role = getattr(user, 'User_Role', None) or ''
+            if role == 'Department-User':
+                dept = _get_user_department(user)
+            elif role == 'Officer':
+                email = (getattr(user, 'email', None) or '').strip()
+                off = Officer.objects.filter(email__iexact=email).first() if email else None
+                if not off:
+                    off = Officer.objects.filter(officer_id=f'OFF{user.id}').first()
+                if not off and getattr(user, 'username', None):
+                    off = Officer.objects.filter(officer_id=user.username).first()
+                dept = off.department if off else None
+
+        officer_qs = Officer.objects.all()
+        complaint_qs = Complaint.objects.all()
+        if dept:
+            officer_qs = officer_qs.filter(department=dept)
+            complaint_qs = complaint_qs.filter(officer_id__department=dept)
+
+        total_officers = officer_qs.count()
+        active_officers = officer_qs.filter(is_available=True).count()
+        inactive_officers = officer_qs.filter(is_available=False).count()
+        total_assigned = complaint_qs.filter(officer_id__isnull=False).count()
+
+        resolved_comp = complaint_qs.filter(status='Completed').count()
+        total_comp = complaint_qs.count()
         sla_compliance = (resolved_comp / total_comp * 100) if total_comp > 0 else 0
 
         overloaded = 0
-        for officer in Officer.objects.all():
+        for officer in officer_qs:
             active_count = Complaint.objects.filter(officer_id=officer.officer_id).exclude(status='Completed').count()
             if active_count > 20:
                 overloaded += 1
@@ -461,6 +644,7 @@ class officerkpi(APIView):
         return Response({
             'total_officers': total_officers,
             'active_officers': active_officers,
+            'inactive_officers': inactive_officers,
             'total_assigned': total_assigned,
             'sla_compliance': round(sla_compliance, 1),
             'overloaded': overloaded
@@ -586,7 +770,7 @@ class Updatecomp(APIView):
         allowed = ['title', 'Description', 'priority_level', 'status', 'location_address', 'location_District', 'location_taluk']
         data = {k: v for k, v in request.data.items() if k in allowed}
 
-        serializer = ComplaintSerializer(complaint, data=data, partial=True)
+        serializer = ComplaintSerializer(complaint, data=data, partial=True, context={'request': request})
         if serializer.is_valid():
             serializer.save()
             return Response({'success': True, 'data': serializer.data}, status=status.HTTP_200_OK)
@@ -599,6 +783,16 @@ class assigncomp(APIView):
             complaint = Complaint.objects.get(pk=pk)
             officer_id = request.data.get('officer_id')
             officer = Officer.objects.get(officer_id=officer_id)
+
+            if getattr(request.user, 'User_Role', None) == 'Department-User':
+                dept = _get_user_department(request.user)
+                if not dept:
+                    return Response({'error': 'No department found for this user'}, status=status.HTTP_403_FORBIDDEN)
+                if not _complaint_belongs_to_department(complaint, dept):
+                    return Response({'error': 'Cannot assign complaints outside your department'}, status=status.HTTP_403_FORBIDDEN)
+                if officer.department_id != dept.id:
+                    return Response({'error': 'Cannot assign outside department'}, status=status.HTTP_403_FORBIDDEN)
+
             complaint.officer_id = officer
             complaint.save()
             return Response({'success': True}, status=status.HTTP_200_OK)
@@ -1014,7 +1208,7 @@ class TrackComplaint(APIView):
     def get(self, request, pk=None):
         try:
             complaint = Complaint.objects.get(id=pk)
-            serializer = ComplaintSerializer(complaint)
+            serializer = ComplaintSerializer(complaint, context={'request': request})
             return Response({
                 'success': True,
                 'data': serializer.data
@@ -1699,39 +1893,55 @@ class UserDistrictWise(APIView):
 
 
 class UserMonthlyRegistrations(APIView):
+    """
+    Monthly signup counts aligned with Admin user list (`created_join` is exposed as date_joined there).
+    Supports ?year=YYYY (defaults to current calendar year). Always returns 12 months (Jan–Dec).
+    """
+
     def get(self, request):
         try:
-            
-            # Get current year
-            current_year = datetime.now().year
-            
-            # Initialize monthly data for current year
-            monthly_data = {}
-            for month_num in range(1, 13):
-                month_name = calendar.month_name[month_num]
-                monthly_data[month_name] = 0
-            
-            # Count user registrations by month for current year
+            year_param = request.query_params.get('year')
+            if year_param and str(year_param).isdigit():
+                target_year = int(year_param)
+            else:
+                target_year = datetime.now().year
+
+            # 12 integers: index 0 = January … index 11 = December
+            monthly_users = [0] * 12
+
             users_by_month = (
-                CustomUser.objects
-                .filter(created_join__year=current_year)
+                CustomUser.objects.filter(created_join__year=target_year)
                 .annotate(month=ExtractMonth('created_join'))
                 .values('month')
                 .annotate(count=Count('id'))
                 .order_by('month')
             )
-            
-            # Fill in actual counts
+
             for item in users_by_month:
-                month_name = calendar.month_name[item['month']]
-                monthly_data[month_name] = item['count']
-            
+                m = item.get('month')
+                if m is None:
+                    continue
+                try:
+                    mi = int(m)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= mi <= 12:
+                    monthly_users[mi - 1] = item.get('count') or 0
+
+            monthly_data = {}
+            for month_num in range(1, 13):
+                month_name = calendar.month_name[month_num]
+                monthly_data[month_name] = monthly_users[month_num - 1]
+
+            total_registrations = CustomUser.objects.filter(created_join__year=target_year).count()
+
             return Response({
-                'year': current_year,
+                'year': target_year,
                 'monthly_data': monthly_data,
-                'total_registrations': CustomUser.objects.filter(created_join__year=current_year).count()
+                'monthly_users': monthly_users,
+                'total_registrations': total_registrations,
             })
-            
+
         except Exception as e:
             return Response({
                 'error': str(e),
@@ -1903,3 +2113,20 @@ def department_complaints(request):
             'error': str(e),
             'message': 'Failed to fetch complaints'
         }, status=500)
+
+class ComplaintCreateView(APIView):
+    parser_classes = (MultiPartParser, FormParser)
+
+def test_email(request):
+    try:
+        from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or 'noreply@example.com'
+        send_mail(
+            "Test Email",
+            "This is a test email from deployed server",
+            from_email,
+            ["your_real_email@gmail.com"],  # change this
+            fail_silently=False,
+        )
+        return JsonResponse({"status": "Email sent successfully"})
+    except Exception as e:
+        return JsonResponse({"error": str(e)})

@@ -16,6 +16,9 @@ VALID_STATUSES = {'Pending', 'In Process', 'Completed'}
 
 # Map legacy / alternate values to canonical
 _STATUS_ALIAS = {
+    'pending':     'Pending',
+    'completed':   'Completed',
+    'in process':  'In Process',
     'in-progress': 'In Process',
     'in_progress': 'In Process',
     'resolved':    'Completed',
@@ -41,15 +44,52 @@ def _get_officer_for_user(user):
     if not user:
         return None
     try:
-        officer = Officer.objects.filter(email=user.email).first()
+        # Primary match: officer email should match logged-in CustomUser email.
+        officer = Officer.objects.filter(email__iexact=user.email).first()
         if officer:
             return officer
+        # Common mapping in this project: Officer.officer_id like OFF<CustomUser.id>.
+        officer = Officer.objects.filter(officer_id=f"OFF{user.id}").first()
+        if officer:
+            return officer
+        # Legacy/alternate mapping by username.
         officer = Officer.objects.filter(officer_id=user.username).first()
         if officer:
             return officer
     except Exception as e:
         print(f"Error getting officer for user {user.username}: {e}")
     return None
+
+
+def _get_officer_department(officer):
+    if not officer:
+        return None
+    return getattr(officer, 'department', None)
+
+
+def _officer_department_complaints(officer):
+    """
+    Officer data visibility = complaints assigned to officer AND in officer department.
+    Uses Category mappings because Complaint has no direct department FK.
+    """
+    if not officer:
+        return Complaint.objects.none()
+
+    qs = Complaint.objects.filter(officer_id=officer)
+    dept = _get_officer_department(officer)
+    # Keep existing assignment flow working: if department link is missing/misaligned,
+    # still show complaints assigned to this officer.
+    if not dept:
+        return qs
+
+    dept_code = dept.category
+    dept_label = dept.get_category_display()
+    dept_scoped = qs.filter(
+        Q(Category__department=dept_code) |
+        Q(Category__code=dept_code) |
+        Q(Category__name=dept_label)
+    )
+    return dept_scoped if dept_scoped.exists() else qs
 
 
 @api_view(['GET'])
@@ -64,7 +104,7 @@ def officer_dashboard_stats(request):
                              'averageResolutionTime': 0, 'performanceScore': 0,
                              'todayComplaints': 0, 'weeklyComplaints': 0})
 
-        qs = Complaint.objects.filter(officer_id=officer)
+        qs = _officer_department_complaints(officer)
         total       = qs.count()
         resolved    = qs.filter(status='Completed').count()
         pending     = qs.filter(status='Pending').count()
@@ -112,7 +152,7 @@ def officer_recent_complaints(request):
             return Response([])
 
         seven_days_ago = timezone.now() - timedelta(days=7)
-        qs = Complaint.objects.filter(officer_id=officer).order_by('-current_time')[:10]
+        qs = _officer_department_complaints(officer).order_by('-current_time')[:10]
         data = []
         for c in qs:
             is_overdue = c.current_time < seven_days_ago and c.status in ['Pending', 'In Process']
@@ -144,7 +184,7 @@ def officer_monthly_trends(request):
 
         MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         current_year = timezone.now().year
-        qs = Complaint.objects.filter(officer_id=officer, current_time__year=current_year)
+        qs = _officer_department_complaints(officer).filter(current_time__year=current_year)
         counts = qs.values('current_time__month').annotate(total=Count('id'))
         month_map = {row['current_time__month']: row['total'] for row in counts}
         data = [{'month': MONTH_NAMES[m - 1], 'complaints': month_map.get(m, 0)} for m in range(1, 13)]
@@ -221,13 +261,9 @@ def officer_profile(request):
                 'phone': getattr(user, 'mobile_number', None),
                 'address': getattr(user, 'address', None),
                 'department': (
-                    user.departments.first().get_category_display()
-                    if hasattr(user, 'departments') and user.departments.exists()
-                    else (
-                        user.headed_department.first().get_category_display()
-                        if hasattr(user, 'headed_department') and user.headed_department.exists()
-                        else None
-                    )
+                    officer.department.get_category_display()
+                    if officer and officer.department
+                    else None
                 ),
                 'designation': 'Officer',
                 'joinDate': user.date_joined.strftime('%Y-%m-%d') if user.date_joined else None,
@@ -274,11 +310,15 @@ def officer_profile(request):
 def officer_complaints(request):
     try:
         officer = _get_officer_for_user(request.user)
+        print(f"[officer_complaints] user_id={request.user.id} email={request.user.email} username={request.user.username}")
+        print(f"[officer_complaints] resolved_officer_id={getattr(officer, 'officer_id', None)}")
         if not officer:
+            print("[officer_complaints] no Officer mapping found for logged-in user")
             return Response({'complaints': [], 'categories': [], 'total': 0,
                              'filters': {'status': 'all', 'category': 'all', 'search': ''}})
 
-        qs = Complaint.objects.filter(officer_id=officer).order_by('-current_time')
+        qs = _officer_department_complaints(officer).order_by('-current_time')
+        print(f"[officer_complaints] assigned_complaints_count={qs.count()}")
 
         status_filter   = request.GET.get('status', 'all')
         category_filter = request.GET.get('category', 'all')
@@ -297,14 +337,23 @@ def officer_complaints(request):
                 Q(title__icontains=search_query) |
                 Q(Description__icontains=search_query)
             )
+        print(
+            f"[officer_complaints] post_filter_count={qs.count()} "
+            f"filters(status={status_filter}, category={category_filter}, priority={priority_filter}, search={search_query!r})"
+        )
 
         categories = list(
-            Complaint.objects.filter(officer_id=officer)
+            _officer_department_complaints(officer)
             .values_list('Category__name', flat=True)
             .distinct()
         )
 
         total_count = qs.count()
+        status_counts = {
+            'pending': _officer_department_complaints(officer).filter(status='Pending').count(),
+            'in_progress': _officer_department_complaints(officer).filter(status='In Process').count(),
+            'completed': _officer_department_complaints(officer).filter(status='Completed').count(),
+        }
 
         try:
             page      = int(request.GET.get('page', 1))
@@ -318,6 +367,7 @@ def officer_complaints(request):
         data = []
         for c in qs:
             is_overdue = c.current_time < seven_days_ago and c.status in ['Pending', 'In Process']
+            image_url = c.image_video if c.image_video else None
             data.append({
                 'id': c.id,
                 'title': c.title or 'Untitled',
@@ -334,7 +384,7 @@ def officer_complaints(request):
                 'citizenEmail': c.user.email if c.user else '',
                 'citizenPhone': getattr(c.user, 'mobile_number', '') or '',
                 'isOverdue': is_overdue,
-                'image': request.build_absolute_uri(c.image_video.url) if c.image_video else None,
+                'image': image_url,
                 'remarks': c.remarks or '',
                 'updatedAt': c.updated_at.strftime('%d %b %Y, %H:%M') if c.updated_at else '',
             })
@@ -343,6 +393,7 @@ def officer_complaints(request):
             'complaints': data,
             'categories': [c for c in categories if c],
             'total': total_count,
+            'statusCounts': status_counts,
             'filters': {'status': status_filter, 'category': category_filter,
                         'priority': priority_filter, 'search': search_query},
         })
@@ -351,7 +402,7 @@ def officer_complaints(request):
         return Response({'error': str(e)}, status=500)
 
 
-@api_view(['POST'])
+@api_view(['POST', 'PATCH'])
 @permission_classes([IsAuthenticated])
 def update_complaint_status(request, complaint_id):
     try:
@@ -359,7 +410,7 @@ def update_complaint_status(request, complaint_id):
         if not officer:
             return Response({'error': 'Officer not found'}, status=404)
 
-        complaint = Complaint.objects.filter(id=complaint_id, officer_id=officer).first()
+        complaint = _officer_department_complaints(officer).filter(id=complaint_id).first()
         if not complaint:
             return Response({'error': 'Complaint not found'}, status=404)
 
@@ -479,7 +530,7 @@ def officer_performance(request):
                 'officerName': 'Test Officer', 'officerId': 'TEST001'
             })
 
-        complaints = Complaint.objects.filter(officer_id=officer)
+        complaints = _officer_department_complaints(officer)
         total_complaints = complaints.count()
         resolved_complaints = complaints.filter(status='Completed').count()
         pending_complaints = complaints.filter(status='Pending').count()

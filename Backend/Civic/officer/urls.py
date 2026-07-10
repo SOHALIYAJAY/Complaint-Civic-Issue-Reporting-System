@@ -10,6 +10,7 @@ urlpatterns = [
     path('monthly-trends/', views.officer_monthly_trends, name='officer_monthly_trends'),
     path('complaints/', views.officer_complaints, name='officer_complaints'),
     path('complaints/<int:complaint_id>/update/', views.update_complaint_status, name='update_complaint_status'),
+    path('complaints/<int:complaint_id>/status/', views.update_complaint_status, name='officer_complaint_status'),
     path('complaints/<int:complaint_id>/history/', views.complaint_status_history, name='complaint_status_history'),
     path('performance/', views.officer_performance, name='officer_performance'),
     path('profile/', views.officer_profile, name='officer_profile'),

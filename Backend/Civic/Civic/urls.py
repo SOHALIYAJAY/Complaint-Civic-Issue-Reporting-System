@@ -19,21 +19,22 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 from django.views.generic import RedirectView
-from complaints.views import createcomplaint
+from complaints.views import CreateComplaintView
 from complaints.district_views import DistrictDetailView
 from Civic import views
-from Civic.views import getcomplaint,getcomplaintlimit,getpubliccomplaints,compinfo,complaintofficer,officerprofile,officerkpi,adminallcomplaintcart,adimncomplaints,ComplaintDelete,assigncomp,crateofficer,CategoriesList,CategoryDelete,adminstats,TrackComplaint,ComplaintStatus,OfficerDelete,OfficerUpdate,OfficerAnalytics,Logout,UserMonthlyRegistrations,admindashboardcard,UserRoleDistribution,ComplaintStatusTrends,CivicUserActivityView,DepartmentList,UserEmailList
+from Civic.views import getcomplaint,getcomplaintlimit,getpubliccomplaints,compinfo,complaintofficer,officerprofile,officerkpi,adminallcomplaintcart,adimncomplaints,ComplaintDelete,assigncomp,crateofficer,CategoriesList,CategoryDelete,adminstats,TrackComplaint,ComplaintStatus,OfficerDelete,OfficerUpdate,OfficerAnalytics,Logout,UserMonthlyRegistrations,admindashboardcard,UserRoleDistribution,ComplaintStatusTrends,CivicUserActivityView,UserEmailList
 from accounts.views import RegisterView, LoginView, LogoutView, GoogleLoginView, UserDetail, UpdateUserDetails, UserListCreateView, UserRetrieveUpdateDeleteView, ChangePasswordView, UserActivityView, ToggleTwoFactorView, UserComplaintsView, TestAPIView, AdminProfileView, AdminUpdateProfileView, AdminSystemSettingsView, VerifyEmailOTP, ResendOTP
 from contact_us.views import ContactUSview
-from departments.views import OfficerDetail, department_profile, department_officers, department_complaints, department_performance, update_department_profile, department_dashboard, departments_overview, department_statistics, department_list_public
+from departments.views import OfficerDetail, department_profile, department_officers, department_complaints, department_performance, update_department_profile, department_dashboard, departments_overview, department_statistics, department_list_public, DepartmentListView
 from departments.admin_urls import urlpatterns as department_admin_urls
 from rest_framework_simplejwt.views import TokenRefreshView
 
 
 urlpatterns = [
+    path('health/', views.health_check, name='health-check'),
     path('favicon.ico', RedirectView.as_view(url='/static/favicon.ico')),
     path('admin/', admin.site.urls),
-    path('api/raisecomplaint/',createcomplaint,name='raisecomplaint'),
+    path('api/raisecomplaint/',CreateComplaintView.as_view(),name='raisecomplaint'),
     path('api/getcomplaint/',getcomplaint.as_view(),name='getcomplaint'),
     path('api/getcomplaintlimit/',getcomplaintlimit.as_view(),name='getcomplaintlimit'),
     path('api/getpubliccomplaints/',getpubliccomplaints.as_view(),name='getpubliccomplaints'),
@@ -50,6 +51,7 @@ urlpatterns = [
     path('api/district/<str:district_name>/', DistrictDetailView.as_view(), name='district-detail'),
     path('api/register/', RegisterView.as_view(), name='register'),
     path('api/verify-email/', VerifyEmailOTP.as_view(), name='verify-email'),
+    path('api/verify-otp/', VerifyEmailOTP.as_view(), name='verify-otp'),
     path('api/resend-otp/', ResendOTP.as_view(), name='resend-otp'),
     path('api/test/', TestAPIView.as_view(), name='test-api'),
     path('api/login/', LoginView.as_view(),name='login'),
@@ -107,7 +109,7 @@ urlpatterns = [
     path('api/complaintindetails/<int:pk>/',views.ComplaintInDetail.as_view(),name='complaintindetails-detail'),
     path('api/complaints/status/',views.ComplaintStatusStats.as_view(),name='complaint-status-stats'),
     path('api/complaints/monthly/',views.ComplaintMonthlyStats.as_view(),name='complaint-monthly-stats'),
-    path('api/departments/', DepartmentList.as_view(), name='departments-list'),
+    path('api/departments/', DepartmentListView.as_view(), name='departments-list'),
     path('api/admin/departments/', include(department_admin_urls)),
     path('api/department/dashboard/', department_dashboard, name='department-dashboard'),
     path('api/departments/overview/', departments_overview, name='departments-overview'),
@@ -123,4 +125,8 @@ urlpatterns = [
     path('api/department/upload-image/', views.DepartmentUploadImage.as_view(), name='department-upload-image'),
     path('api/UserDistrictWise/',views.UserDistrictWise.as_view(),name='UserDistrictWise'),
     path('api/user-registrations/monthly/', UserMonthlyRegistrations.as_view(), name='user-monthly-registrations'),
-] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    path('api/user/stats/', views.UserStatsView.as_view(), name='user-stats'),
+    path('api/stats/', views.GlobalStatsView.as_view(), name='global-stats'),
+]
+
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
